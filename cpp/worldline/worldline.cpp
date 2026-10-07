@@ -16,7 +16,9 @@
 #include "worldline/f0/dio_ss_estimator.h"
 #include "worldline/f0/f0_estimator.h"
 #include "worldline/f0/harvest_estimator.h"
+#ifndef OPENUTAU_HEADLESS_WORLD_ONLY
 #include "worldline/f0/pyin_estimator.h"
+#endif
 #include "worldline/model/continuous_noise.h"
 #include "worldline/model/effects.h"
 
@@ -63,9 +65,11 @@ DLL_API int F0(const float* samples, int length, int fs, double frame_period,
     case 1:
       estimator = std::make_unique<worldline::HarvestEstimator>();
       break;
+#ifndef OPENUTAU_HEADLESS_WORLD_ONLY
     case 2:
       estimator = std::make_unique<worldline::PyinEstimator>();
       break;
+#endif
     default:
       estimator = std::make_unique<worldline::DioEstimator>();
       break;

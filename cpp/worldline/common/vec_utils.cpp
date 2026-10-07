@@ -6,7 +6,9 @@
 #include <string>
 #include <vector>
 
+#ifndef OPENUTAU_HEADLESS_WORLD_ONLY
 #include "npy.hpp"
+#endif
 
 namespace worldline {
 
@@ -54,6 +56,7 @@ double vec_maxabs(const std::vector<double>& vec) {
   return std::max(std::abs(*result.first), std::abs(*result.second));
 }
 
+#ifndef OPENUTAU_HEADLESS_WORLD_ONLY
 void save_vec(const std::string& filename, const std::vector<double>& vec) {
   unsigned long shape[1];
   shape[0] = vec.size();
@@ -68,5 +71,7 @@ void save_vec2d(const std::string& filename,
   shape[1] = vec[0].size();
   npy::SaveArrayAsNumpy<double>(filename, false, 2, shape, temp);
 }
+
+#endif
 
 }  // namespace worldline
