@@ -55,6 +55,22 @@ public class ResourcesTests {
         Assert.Throws<InvalidDataException>(() => new Voicebank(resources, Encoding.UTF8));
     }
 
+    [Fact]
+    public void SourceDurationIsBoundedBeforeWorldAnalysis() {
+        var pcm = new byte[44100 * 2];
+        using var wave = new MemoryStream();
+        using (var writer = new BinaryWriter(wave, Encoding.ASCII, true)) {
+            writer.Write(0x46464952u); writer.Write(36 + pcm.Length); writer.Write(0x45564157u);
+            writer.Write(0x20746d66u); writer.Write(16u); writer.Write((ushort)1); writer.Write((ushort)1);
+            writer.Write(44100u); writer.Write(88200u); writer.Write((ushort)2); writer.Write((ushort)16);
+            writer.Write(0x61746164u); writer.Write(pcm.Length); writer.Write(pcm);
+        }
+        var resources = new StreamVoicebankResources(["oto.ini", "i.wav"], name =>
+            new MemoryStream(name == "oto.ini" ? "i.wav=i,0,0,0,0,0"u8.ToArray() : wave.ToArray()));
+        using var renderer = new WorldRenderer(new Voicebank(resources, Encoding.UTF8), maximumSourceSeconds: .1);
+        Assert.Throws<InvalidDataException>(() => renderer.MeasurePitch("i"));
+    }
+
     private static StreamVoicebankResources BankResources(List<string> opened) => new(["oto.ini", "i.wav"], name => {
         opened.Add(name);
         return new MemoryStream(name == "oto.ini" ? Encoding.UTF8.GetBytes("i.wav=- bi,12,50,-200,40,10\ni.wav=i,0,50,0,0,0\ni.wav=i -,0,50,0,0,0") : [1, 2, 3]);

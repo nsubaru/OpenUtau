@@ -41,6 +41,7 @@ public sealed class WorldRenderer : IDisposable {
     private const double Period = Hop * 1000.0 / Rate;
     private readonly Voicebank bank;
     private readonly long cacheBudget;
+    private readonly double maximumSourceSeconds;
     private readonly Dictionary<VoicebankSample, Features> cache = [];
     private readonly LinkedList<VoicebankSample> recent = [];
     private long cacheBytes;
@@ -55,9 +56,12 @@ public sealed class WorldRenderer : IDisposable {
     /// </summary>
     /// <param name="bank">Metadata-loaded voicebank.</param>
     /// <param name="maximumCacheBytes">Maximum retained WORLD analysis bytes; defaults to 64 MiB.</param>
-    public WorldRenderer(Voicebank bank, long maximumCacheBytes = 64 * 1024 * 1024) {
+    /// <param name="maximumSourceSeconds">Maximum decoded source duration, between 0.01 and 30 seconds.</param>
+    public WorldRenderer(Voicebank bank, long maximumCacheBytes = 64 * 1024 * 1024, double maximumSourceSeconds = 30) {
         if (maximumCacheBytes < 0) throw new ArgumentOutOfRangeException(nameof(maximumCacheBytes));
+        if (!double.IsFinite(maximumSourceSeconds) || maximumSourceSeconds is < .01 or > 30) throw new ArgumentOutOfRangeException(nameof(maximumSourceSeconds));
         this.bank = bank; cacheBudget = maximumCacheBytes;
+        this.maximumSourceSeconds = maximumSourceSeconds;
     }
 
     /// <summary>
@@ -150,7 +154,7 @@ public sealed class WorldRenderer : IDisposable {
     private Features Analyze(VoicebankSample sample) {
         if (cache.TryGetValue(sample, out var existing)) { recent.Remove(sample); recent.AddLast(sample); return existing; }
         using var stream = bank.Resources.Open(sample.Resource);
-        var samples = WaveSamples.Read(stream, Rate);
+        var samples = WaveSamples.Read(stream, Rate, maximumSourceSeconds);
         var start = Math.Clamp((int)Math.Round(Math.Max(0, sample.Offset) * Rate / 1000), 0, samples.Length);
         var end = sample.Cutoff < 0 ? start + (int)Math.Round(-sample.Cutoff * Rate / 1000) : samples.Length - (int)Math.Round(sample.Cutoff * Rate / 1000);
         end = Math.Clamp(end, start, samples.Length);
@@ -193,7 +197,7 @@ public sealed class WorldRenderer : IDisposable {
 }
 
 internal static class WaveSamples {
-    internal static float[] Read(Stream stream, int targetRate) {
+    internal static float[] Read(Stream stream, int targetRate, double maximumSeconds) {
         using var reader = new BinaryReader(stream, System.Text.Encoding.ASCII, true);
         if (reader.ReadUInt32() != 0x46464952) throw new InvalidDataException("Voicebank sample must be RIFF WAV.");
         reader.ReadUInt32();
@@ -219,6 +223,10 @@ internal static class WaveSamples {
         var stride = bits / 8 * channels;
         if (data.Length % stride != 0) throw new InvalidDataException("Incomplete WAV sample frame.");
         var sourceCount = data.Length / stride;
+        if (sourceCount == 0 || sourceCount > rate * maximumSeconds) {
+            Array.Clear(data);
+            throw new InvalidDataException("Voicebank source exceeds the configured duration bound.");
+        }
         var source = new float[sourceCount];
         for (var i = 0; i < sourceCount; i++) {
             double sum = 0;
