@@ -46,6 +46,7 @@ public sealed class WorldRenderer : IDisposable {
     private readonly LinkedList<VoicebankSample> recent = [];
     private long cacheBytes;
     private readonly object sync = new();
+    private static readonly object NativeGate = new();
     private bool disposed;
     private sealed record Features(double[] F0, double[] Spectrum, double[] Aperiodicity) {
         public long Bytes => (long)(F0.Length + Spectrum.Length + Aperiodicity.Length) * 8;
@@ -79,75 +80,169 @@ public sealed class WorldRenderer : IDisposable {
     }
 
     /// <summary>
-    /// Renders a bounded window of supplied aliases, with optional continuous MIDI pitch.
+    /// Renders a bounded window using continuous phrase synthesis from the timeline origin.
     /// </summary>
-    /// <param name="segments">Resolved phonemes on the phrase timeline.</param>
+    /// <param name="segments">Ordered, nonoverlapping aliases on the phrase timeline.</param>
     /// <param name="startMilliseconds">Start of the requested output window.</param>
     /// <param name="durationMilliseconds">Window length, greater than zero and at most 30 seconds.</param>
     /// <param name="controls">Validated renderer controls.</param>
-    /// <param name="pitch">Optional MIDI contour evaluated on the global millisecond timeline.</param>
-    /// <param name="cancellation">Cancels between phoneme renders.</param>
-    /// <returns>Mono 44.1 kHz little-endian PCM16 for precisely the requested window.</returns>
+    /// <param name="pitch">Optional MIDI contour on the global millisecond timeline.</param>
+    /// <param name="cancellation">Cancels between parameter and audio pages.</param>
+    /// <returns>Mono 44.1 kHz PCM16 for precisely the requested window.</returns>
     public byte[] Render(IReadOnlyList<PhonemeSegment> segments, double startMilliseconds, double durationMilliseconds,
         WorldControls controls, Func<double, double>? pitch = null, CancellationToken cancellation = default) {
         if (!double.IsFinite(startMilliseconds) || startMilliseconds < 0 || !double.IsFinite(durationMilliseconds) || durationMilliseconds is <= 0 or > 30000)
             throw new ArgumentOutOfRangeException(nameof(durationMilliseconds));
+        var first = checked((long)Math.Round(startMilliseconds * Rate / 1000));
+        var result = new byte[checked((int)Math.Round(durationMilliseconds * Rate / 1000)) * 2];
+        long position = 0;
+        var totalDuration = Math.Max(startMilliseconds + durationMilliseconds, segments.Count == 0 ? 0 : segments[^1].StartMilliseconds + segments[^1].DurationMilliseconds + 100);
+        foreach (var page in RenderPages(segments, totalDuration, controls, pitch, cancellation: cancellation)) {
+            try {
+                var begin = Math.Max(first, position);
+                var end = Math.Min(first + result.Length / 2, position + page.Length / 2);
+                if (begin < end) page.AsSpan(checked((int)(begin - position) * 2), checked((int)(end - begin) * 2))
+                    .CopyTo(result.AsSpan(checked((int)(begin - first) * 2)));
+                position += page.Length / 2;
+                if (position >= first + result.Length / 2) break;
+            } finally { Array.Clear(page); }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Synthesizes connected aliases with one WORLD pulse train and bounded parameter and PCM pages.
+    /// </summary>
+    /// <param name="segments">Ordered, nonoverlapping aliases; gaps remain rests.</param>
+    /// <param name="durationMilliseconds">Output duration from the timeline origin, below WORLD's signed sample limit.</param>
+    /// <param name="controls">Normalized voice controls and output gain.</param>
+    /// <param name="pitch">Optional MIDI contour on the global millisecond timeline.</param>
+    /// <param name="firstPageMilliseconds">First output page length, between 1 and 5000 milliseconds.</param>
+    /// <param name="pageMilliseconds">Subsequent page length, between 1 and 5000 milliseconds.</param>
+    /// <param name="cancellation">Cancels before source analysis and between audio blocks.</param>
+    /// <returns>Caller-owned PCM16 pages; abandoning enumeration disposes native synthesis state.</returns>
+    public IEnumerable<byte[]> RenderPages(IReadOnlyList<PhonemeSegment> segments, double durationMilliseconds,
+        WorldControls controls, Func<double, double>? pitch = null, double firstPageMilliseconds = 250,
+        double pageMilliseconds = 5000, CancellationToken cancellation = default) {
+        if (!double.IsFinite(durationMilliseconds) || durationMilliseconds <= 0 || durationMilliseconds * Rate / 1000 >= int.MaxValue - Rate)
+            throw new ArgumentOutOfRangeException(nameof(durationMilliseconds));
+        foreach (var length in new[] { firstPageMilliseconds, pageMilliseconds })
+            if (!double.IsFinite(length) || length is < 1 or > 5000) throw new ArgumentOutOfRangeException(nameof(pageMilliseconds));
         foreach (var value in new[] { controls.Timbre, controls.Tension, controls.Breathiness, controls.Voicing })
             if (!double.IsFinite(value) || value is < 0 or > 1) throw new ArgumentOutOfRangeException(nameof(controls));
         if (!double.IsFinite(controls.GainDecibels) || controls.GainDecibels is < -60 or > 24) throw new ArgumentOutOfRangeException(nameof(controls));
+        double lastEnd = 0;
+        foreach (var segment in segments) {
+            if (!double.IsFinite(segment.StartMilliseconds) || segment.StartMilliseconds < lastEnd - 1e-6 ||
+                !double.IsFinite(segment.DurationMilliseconds) || segment.DurationMilliseconds is <= 0 or > 30000 ||
+                !double.IsFinite(segment.Midi) || segment.Midi is < 0 or > 127)
+                throw new ArgumentException("Aliases must have finite nonoverlapping intervals and MIDI pitch.", nameof(segments));
+            lastEnd = segment.StartMilliseconds + segment.DurationMilliseconds;
+        }
         lock (sync) {
             ObjectDisposedException.ThrowIf(disposed, this);
-            var output = new double[checked((int)Math.Round(durationMilliseconds * Rate / 1000))];
+            nint stream;
+            lock (NativeGate) { stream = Native.WorldStreamCreate(); }
+            if (stream == 0) throw new InvalidOperationException("Unable to create continuous WORLD synthesis.");
+            var samples = checked((int)Math.Round(durationMilliseconds * Rate / 1000));
+            var frameLimit = checked((int)Math.Ceiling((durationMilliseconds + 100) / Period) + 1);
+            var f0 = new double[10];
+            var spectrum = new double[10 * Width];
+            var aperiodicity = new double[spectrum.Length];
+            var block = new double[512];
+            var frame = 0;
+            var emitted = 0;
+            var segmentIndex = 0;
+            var gain = Math.Pow(10, controls.GainDecibels / 20);
+            byte[]? page = null;
             try {
-                foreach (var segment in segments) {
+                page = new byte[Math.Min(samples, (int)Math.Round(firstPageMilliseconds * Rate / 1000)) * 2];
+                var filled = 0;
+                while (emitted < samples) {
                     cancellation.ThrowIfCancellationRequested();
-                    if (segment.StartMilliseconds + segment.DurationMilliseconds <= startMilliseconds || segment.StartMilliseconds >= startMilliseconds + durationMilliseconds) continue;
-                    if (segment.DurationMilliseconds is <= 0 or > 30000) throw new InvalidDataException("Phoneme duration exceeds a bounded render window.");
-                    var sample = bank.Find(segment.Alias, (int)Math.Round(segment.Midi)) ?? throw new InvalidDataException($"Missing alias {segment.Alias}.");
-                    var source = Analyze(sample);
-                    var frames = Math.Max(2, checked((int)Math.Ceiling(segment.DurationMilliseconds / Period)) + 1);
-                    var f0 = new double[frames];
-                    var sp = new double[checked(frames * Width)];
-                    var ap = new double[sp.Length];
-                    var gender = Enumerable.Repeat(controls.Timbre, frames).ToArray();
-                    var tension = Enumerable.Repeat(controls.Tension, frames).ToArray();
-                    var breath = Enumerable.Repeat(controls.Breathiness, frames).ToArray();
-                    var voicing = Enumerable.Repeat(controls.Voicing, frames).ToArray();
-                    var sourceDuration = (source.F0.Length - 1) * Period;
-                    var fixedDuration = Math.Clamp(sample.Consonant, 0, Math.Min(sourceDuration * .8, segment.DurationMilliseconds * .5));
-                    for (var frame = 0; frame < frames; frame++) {
-                        var time = Math.Min(segment.DurationMilliseconds, frame * Period);
-                        var sourceTime = time < fixedDuration ? time : fixedDuration +
-                            (time - fixedDuration) * (sourceDuration - fixedDuration) / Math.Max(1, segment.DurationMilliseconds - fixedDuration);
-                        var position = Math.Clamp(sourceTime / Period, 0, source.F0.Length - 1);
-                        var left = (int)position; var right = Math.Min(left + 1, source.F0.Length - 1); var fraction = position - left;
-                        var midi = pitch?.Invoke(segment.StartMilliseconds + time) ?? segment.Midi;
-                        if (!double.IsFinite(midi) || midi is < 0 or > 127) throw new InvalidDataException("Pitch curve exceeds MIDI range.");
-                        f0[frame] = source.F0[left] <= 0 ? 0 : 440 * Math.Pow(2, (midi - 69) / 12);
-                        for (var bin = 0; bin < Width; bin++) {
-                            sp[frame * Width + bin] = source.Spectrum[left * Width + bin] * (1 - fraction) + source.Spectrum[right * Width + bin] * fraction;
-                            ap[frame * Width + bin] = source.Aperiodicity[left * Width + bin] * (1 - fraction) + source.Aperiodicity[right * Width + bin] * fraction;
+                    int count;
+                    lock (NativeGate) { count = Native.WorldStreamRead(stream, block); }
+                    if (count < 0) throw new InvalidOperationException("WORLD streaming synthesis failed.");
+                    if (count == 0) {
+                        if (frame >= frameLimit) throw new InvalidOperationException("WORLD did not flush the requested output duration.");
+                        var frames = Math.Min(10, frameLimit - frame);
+                        // At least two final frames are required by WORLD's interpolation.
+                        if (frames == 1) frames = 2;
+                        Array.Clear(spectrum); Array.Fill(aperiodicity, 1);
+                        for (var index = 0; index < frames; index++, frame++) {
+                            var time = frame * Period;
+                            while (segmentIndex < segments.Count && segments[segmentIndex].StartMilliseconds + segments[segmentIndex].DurationMilliseconds <= time)
+                                segmentIndex++;
+                            f0[index] = 0;
+                            spectrum.AsSpan(index * Width, Width).Fill(1e-16);
+                            if (segmentIndex < segments.Count && time >= segments[segmentIndex].StartMilliseconds && time < durationMilliseconds) {
+                                FillFrame(segments[segmentIndex], time, pitch, spectrum.AsSpan(index * Width, Width), aperiodicity.AsSpan(index * Width, Width), out f0[index]);
+                                // Blend adjacent source envelopes, rather than fading each phoneme to silence.
+                                var next = segmentIndex + 1;
+                                if (next < segments.Count && Math.Abs(segments[next].StartMilliseconds - segments[segmentIndex].StartMilliseconds - segments[segmentIndex].DurationMilliseconds) < 1) {
+                                    var sample = bank.Find(segments[next].Alias, (int)Math.Round(segments[next].Midi)) ?? throw new InvalidDataException($"Missing alias {segments[next].Alias}.");
+                                    var blend = Math.Min(Math.Clamp(sample.Overlap, 5, 30), Math.Min(segments[segmentIndex].DurationMilliseconds, segments[next].DurationMilliseconds) / 4);
+                                    var boundary = segments[next].StartMilliseconds;
+                                    if (time > boundary - blend) {
+                                        var sp = new double[Width]; var ap = new double[Width];
+                                        FillFrame(segments[next], boundary, pitch, sp, ap, out var nextF0);
+                                        var weight = (time - boundary + blend) / blend;
+                                        for (var bin = 0; bin < Width; bin++) {
+                                            spectrum[index * Width + bin] = spectrum[index * Width + bin] * (1 - weight) + sp[bin] * weight;
+                                            aperiodicity[index * Width + bin] = aperiodicity[index * Width + bin] * (1 - weight) + ap[bin] * weight;
+                                        }
+                                        f0[index] = f0[index] > 0 && nextF0 > 0 ? f0[index] * (1 - weight) + nextF0 * weight :
+                                            weight >= .5 ? nextF0 : f0[index];
+                                    }
+                                }
+                            }
+                        }
+                        lock (NativeGate) {
+                            if (Native.WorldStreamAdd(stream, f0, frames, spectrum, aperiodicity, controls.Timbre,
+                                controls.Tension, controls.Breathiness, controls.Voicing) != 1)
+                                throw new InvalidOperationException("WORLD parameter queue could not make progress.");
+                        }
+                        continue;
+                    }
+                    for (var index = 0; index < count && emitted < samples; index++, emitted++) {
+                        // Taper only phrase edges; internal phoneme and PCM-page joins retain their energy and phase.
+                        var taper = Math.Min(1, Math.Min(emitted, samples - 1 - emitted) / (Rate / 200.0));
+                        var value = double.IsFinite(block[index]) ? Math.Clamp(block[index] * gain * taper, -1, 1) : 0;
+                        BinaryPrimitives.WriteInt16LittleEndian(page!.AsSpan(filled, 2), (short)Math.Round(value * 32767));
+                        filled += 2;
+                        if (filled == page!.Length) {
+                            var completed = page; page = null;
+                            yield return completed;
+                            filled = 0;
+                            if (emitted + 1 < samples) page = new byte[Math.Min(samples - emitted - 1, (int)Math.Round(pageMilliseconds * Rate / 1000)) * 2];
                         }
                     }
-                    var rendered = new double[Native.WorldSynthesisSampleCount(frames, Period, Rate)];
-                    Native.WorldSynthesis(f0, frames, sp, false, 0, ap, false, Fft, Period, Rate, rendered, gender, tension, breath, voicing);
-                    var offset = checked((int)Math.Round((segment.StartMilliseconds - startMilliseconds) * Rate / 1000));
-                    var length = Math.Min(rendered.Length, checked((int)Math.Round(segment.DurationMilliseconds * Rate / 1000)));
-                    // Short tapers remove discontinuities without changing supplied note timing.
-                    var fade = Math.Min(length / 4, Rate / 200);
-                    for (var i = Math.Max(0, -offset); i < length && offset + i < output.Length; i++) {
-                        var taper = fade == 0 ? 1 : Math.Min(1, Math.Min((double)i / fade, (double)(length - 1 - i) / fade));
-                        output[offset + i] += rendered[i] * taper;
-                    }
                 }
-                var bytes = new byte[output.Length * 2]; var gain = Math.Pow(10, controls.GainDecibels / 20);
-                for (var i = 0; i < output.Length; i++) {
-                    var value = double.IsFinite(output[i]) ? Math.Clamp(output[i] * gain, -1, 1) : 0;
-                    BinaryPrimitives.WriteInt16LittleEndian(bytes.AsSpan(i * 2, 2), (short)Math.Round(value * 32767));
-                }
-                return bytes;
+            } finally {
+                lock (NativeGate) { Native.WorldStreamDestroy(stream); }
+                if (page != null) Array.Clear(page);
+                Array.Clear(block); Array.Clear(f0); Array.Clear(spectrum); Array.Clear(aperiodicity);
             }
-            finally { Array.Clear(output); }
+        }
+    }
+
+    private void FillFrame(PhonemeSegment segment, double time, Func<double, double>? pitch, Span<double> spectrum, Span<double> aperiodicity, out double f0) {
+        var sample = bank.Find(segment.Alias, (int)Math.Round(segment.Midi)) ?? throw new InvalidDataException($"Missing alias {segment.Alias}.");
+        var source = Analyze(sample);
+        var sourceDuration = (source.F0.Length - 1) * Period;
+        var sourceFixed = Math.Clamp(Math.Max(sample.Consonant, sample.Preutterance), 0, sourceDuration);
+        var outputFixed = Math.Min(sourceFixed, segment.DurationMilliseconds * .45);
+        var offset = Math.Clamp(time - segment.StartMilliseconds, 0, segment.DurationMilliseconds);
+        var sourceTime = offset < outputFixed ? offset * sourceFixed / outputFixed : sourceFixed +
+            (offset - outputFixed) * (sourceDuration - sourceFixed) / Math.Max(1, segment.DurationMilliseconds - outputFixed);
+        var position = Math.Clamp(sourceTime / Period, 0, source.F0.Length - 1);
+        var left = (int)position; var right = Math.Min(left + 1, source.F0.Length - 1); var fraction = position - left;
+        var midi = pitch?.Invoke(time) ?? segment.Midi;
+        if (!double.IsFinite(midi) || midi is < 0 or > 127) throw new InvalidDataException("Pitch curve exceeds MIDI range.");
+        f0 = source.F0[(int)Math.Round(position)] <= 0 ? 0 : 440 * Math.Pow(2, (midi - 69) / 12);
+        for (var bin = 0; bin < Width; bin++) {
+            spectrum[bin] = source.Spectrum[left * Width + bin] * (1 - fraction) + source.Spectrum[right * Width + bin] * fraction;
+            aperiodicity[bin] = source.Aperiodicity[left * Width + bin] * (1 - fraction) + source.Aperiodicity[right * Width + bin] * fraction;
         }
     }
 
@@ -163,9 +258,11 @@ public sealed class WorldRenderer : IDisposable {
         var frames = Native.F0FrameCount(trimmed.Length, Rate, Period, 0);
         var result = new Features(new double[frames], new double[checked(frames * Width)], new double[checked(frames * Width)]);
         try {
-            Native.F0(trimmed, trimmed.Length, Rate, Period, 0, result.F0);
-            Native.InitAnalysisConfig(out var config, Rate, Hop, Fft);
-            Native.WorldAnalysisF0In(ref config, trimmed, trimmed.Length, result.F0, frames, result.Spectrum, result.Aperiodicity);
+            lock (NativeGate) {
+                Native.F0(trimmed, trimmed.Length, Rate, Period, 0, result.F0);
+                Native.InitAnalysisConfig(out var config, Rate, Hop, Fft);
+                Native.WorldAnalysisF0In(ref config, trimmed, trimmed.Length, result.F0, frames, result.Spectrum, result.Aperiodicity);
+            }
         }
         finally { Array.Clear(trimmed); }
         if (result.Bytes <= cacheBudget) {
@@ -184,6 +281,10 @@ public sealed class WorldRenderer : IDisposable {
 
     private static class Native {
         private const string Library = "openutau-worldcpu";
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern nint WorldStreamCreate();
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int WorldStreamAdd(nint stream, double[] f0, int frames, double[] sp, double[] ap, double timbre, double tension, double breathiness, double voicing);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int WorldStreamRead(nint stream, double[] output);
+        [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern void WorldStreamDestroy(nint stream);
         [StructLayout(LayoutKind.Sequential)]
         internal struct Config { internal int Fs, Hop, Fft; internal float Floor; internal double Period; }
         [DllImport(Library, CallingConvention = CallingConvention.Cdecl)] internal static extern int F0FrameCount(int length, int fs, double period, int method);

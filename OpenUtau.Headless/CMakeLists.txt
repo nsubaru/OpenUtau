@@ -15,8 +15,13 @@ FetchContent_Declare(spline
     PATCH_COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=<SOURCE_DIR> -DGIT_EXECUTABLE=${GIT_EXECUTABLE} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/../cpp/third_party/spline.patch -P ${CMAKE_CURRENT_SOURCE_DIR}/ApplyPatch.cmake)
 FetchContent_MakeAvailable(world spline)
 file(GLOB WORLD_SOURCES CONFIGURE_DEPENDS "${world_SOURCE_DIR}/src/*.cpp")
+# Real-time synthesis gets caller-owned noise state without patching the pinned
+# WORLD dependency or changing the analysis/batch synthesis entry points.
+set_source_files_properties("${world_SOURCE_DIR}/src/synthesisrealtime.cpp"
+    PROPERTIES COMPILE_DEFINITIONS "randn=WorldStreamRandom")
 add_library(openutau-worldcpu SHARED
     ${WORLD_SOURCES}
+    world_stream.cpp
     ../cpp/worldline/worldline.cpp
     ../cpp/worldline/common/vec_utils.cpp
     ../cpp/worldline/f0/dio_estimator.cpp
