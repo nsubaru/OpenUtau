@@ -50,6 +50,7 @@ public sealed class WorldRenderer : IDisposable {
     private bool disposed;
     private sealed record Features(double[] F0, double[] Spectrum, double[] Aperiodicity) {
         public long Bytes => (long)(F0.Length + Spectrum.Length + Aperiodicity.Length) * 8;
+        public int LastVoicedFrame { get; set; } = -1;
     }
 
     /// <summary>
@@ -149,6 +150,8 @@ public sealed class WorldRenderer : IDisposable {
             var f0 = new double[10];
             var spectrum = new double[10 * Width];
             var aperiodicity = new double[spectrum.Length];
+            var joiningSpectrum = new double[Width];
+            var joiningAperiodicity = new double[Width];
             var block = new double[512];
             var frame = 0;
             var emitted = 0;
@@ -176,23 +179,30 @@ public sealed class WorldRenderer : IDisposable {
                             f0[index] = 0;
                             spectrum.AsSpan(index * Width, Width).Fill(1e-16);
                             if (segmentIndex < segments.Count && time >= segments[segmentIndex].StartMilliseconds && time < durationMilliseconds) {
-                                FillFrame(segments[segmentIndex], time, pitch, spectrum.AsSpan(index * Width, Width), aperiodicity.AsSpan(index * Width, Width), out f0[index]);
-                                // Blend adjacent source envelopes, rather than fading each phoneme to silence.
+                                var sp = spectrum.AsSpan(index * Width, Width);
+                                var ap = aperiodicity.AsSpan(index * Width, Width);
                                 var next = segmentIndex + 1;
-                                if (next < segments.Count && Math.Abs(segments[next].StartMilliseconds - segments[segmentIndex].StartMilliseconds - segments[segmentIndex].DurationMilliseconds) < 1) {
-                                    var sample = bank.Find(segments[next].Alias, (int)Math.Round(segments[next].Midi)) ?? throw new InvalidDataException($"Missing alias {segments[next].Alias}.");
-                                    var blend = Math.Min(Math.Clamp(sample.Overlap, 5, 30), Math.Min(segments[segmentIndex].DurationMilliseconds, segments[next].DurationMilliseconds) / 4);
+                                var connectedAfter = next < segments.Count && Connected(segments[segmentIndex], segments[next]);
+                                FillFrame(segments[segmentIndex], time, connectedAfter, pitch, sp, ap, out f0[index]);
+                                // Both sources advance at the same global time through a symmetric OTO join.
+                                // A linked vowel supplies its lead-in before the boundary, then continues without replaying the consonant.
+                                if (segmentIndex > 0 && Connected(segments[segmentIndex - 1], segments[segmentIndex])) {
+                                    var blend = JoinDuration(segments[segmentIndex - 1], segments[segmentIndex]);
+                                    var boundary = segments[segmentIndex].StartMilliseconds;
+                                    if (time < boundary + blend / 2) {
+                                        FillFrame(segments[segmentIndex - 1], time, true, pitch, joiningSpectrum, joiningAperiodicity, out var previousF0);
+                                        var weight = SmoothJoin(.5 + (time - boundary) / blend);
+                                        MixFrame(joiningSpectrum, joiningAperiodicity, previousF0, sp, ap, f0[index], weight, sp, ap, out f0[index]);
+                                    }
+                                }
+                                if (connectedAfter) {
+                                    var blend = JoinDuration(segments[segmentIndex], segments[next]);
                                     var boundary = segments[next].StartMilliseconds;
-                                    if (time > boundary - blend) {
-                                        var sp = new double[Width]; var ap = new double[Width];
-                                        FillFrame(segments[next], boundary, pitch, sp, ap, out var nextF0);
-                                        var weight = (time - boundary + blend) / blend;
-                                        for (var bin = 0; bin < Width; bin++) {
-                                            spectrum[index * Width + bin] = spectrum[index * Width + bin] * (1 - weight) + sp[bin] * weight;
-                                            aperiodicity[index * Width + bin] = aperiodicity[index * Width + bin] * (1 - weight) + ap[bin] * weight;
-                                        }
-                                        f0[index] = f0[index] > 0 && nextF0 > 0 ? f0[index] * (1 - weight) + nextF0 * weight :
-                                            weight >= .5 ? nextF0 : f0[index];
+                                    if (time > boundary - blend / 2) {
+                                        var following = next + 1 < segments.Count && Connected(segments[next], segments[next + 1]);
+                                        FillFrame(segments[next], time, following, pitch, joiningSpectrum, joiningAperiodicity, out var nextF0);
+                                        var weight = SmoothJoin(.5 + (time - boundary) / blend);
+                                        MixFrame(sp, ap, f0[index], joiningSpectrum, joiningAperiodicity, nextF0, weight, sp, ap, out f0[index]);
                                     }
                                 }
                             }
@@ -222,21 +232,53 @@ public sealed class WorldRenderer : IDisposable {
                 lock (NativeGate) { Native.WorldStreamDestroy(stream); }
                 if (page != null) Array.Clear(page);
                 Array.Clear(block); Array.Clear(f0); Array.Clear(spectrum); Array.Clear(aperiodicity);
+                Array.Clear(joiningSpectrum); Array.Clear(joiningAperiodicity);
             }
         }
     }
 
-    private void FillFrame(PhonemeSegment segment, double time, Func<double, double>? pitch, Span<double> spectrum, Span<double> aperiodicity, out double f0) {
+    private static bool Connected(PhonemeSegment previous, PhonemeSegment next) =>
+        Math.Abs(next.StartMilliseconds - previous.StartMilliseconds - previous.DurationMilliseconds) < 1e-6;
+
+    private double JoinDuration(PhonemeSegment previous, PhonemeSegment next) {
+        var sample = bank.Find(next.Alias, (int)Math.Round(next.Midi)) ?? throw new InvalidDataException($"Missing alias {next.Alias}.");
+        return Math.Min(Math.Clamp(sample.Overlap, 10, 60), Math.Min(previous.DurationMilliseconds, next.DurationMilliseconds) / 2);
+    }
+
+    private static double SmoothJoin(double weight) => weight * weight * (3 - 2 * weight);
+
+    private static void MixFrame(ReadOnlySpan<double> leftSpectrum, ReadOnlySpan<double> leftAperiodicity, double leftF0,
+        ReadOnlySpan<double> rightSpectrum, ReadOnlySpan<double> rightAperiodicity, double rightF0, double weight,
+        Span<double> spectrum, Span<double> aperiodicity, out double f0) {
+        for (var bin = 0; bin < Width; bin++) {
+            spectrum[bin] = leftSpectrum[bin] * (1 - weight) + rightSpectrum[bin] * weight;
+            aperiodicity[bin] = leftAperiodicity[bin] * (1 - weight) + rightAperiodicity[bin] * weight;
+        }
+        f0 = leftF0 > 0 && rightF0 > 0 ? leftF0 * (1 - weight) + rightF0 * weight : weight >= .5 ? rightF0 : leftF0;
+    }
+
+    private void FillFrame(PhonemeSegment segment, double time, bool connectedAfter, Func<double, double>? pitch,
+        Span<double> spectrum, Span<double> aperiodicity, out double f0) {
         var sample = bank.Find(segment.Alias, (int)Math.Round(segment.Midi)) ?? throw new InvalidDataException($"Missing alias {segment.Alias}.");
         var source = Analyze(sample);
         var sourceDuration = (source.F0.Length - 1) * Period;
-        // VC/CC transitions and releases begin at the OTO anchor. Their leading recorded vowel belongs to the previous segment.
-        var sourceStart = segment.IsEnding || segment.IsTransition ? Math.Clamp(sample.Preutterance, 0, sourceDuration) : 0;
-        var sourceFixed = Math.Clamp(Math.Max(sample.Consonant, sample.Preutterance) - sourceStart, 0, sourceDuration - sourceStart);
+        var anchored = segment.IsEnding || segment.IsLinkedVowel || segment.IsTransition && !segment.Alias.StartsWith("- ", StringComparison.Ordinal);
+        var sourceStart = anchored ? Math.Clamp(sample.Preutterance, 0, sourceDuration) : 0;
+        var sourceEnd = sourceDuration;
+        if (segment.IsTransition) {
+            // VC/CC content ends at its fixed consonant marker; the following recorded vowel belongs to another syllable.
+            sourceEnd = Math.Min(sourceDuration, Math.Max(sample.Consonant, sourceStart + 20));
+        } else if (!segment.IsEnding && connectedAfter && source.LastVoicedFrame * Period > Math.Max(sample.Consonant, sourceStart)) {
+            // An attached release supplies the ending. Do not insert source-analysis edge devoicing before it.
+            sourceEnd = Math.Min(sourceDuration, Math.Max(Math.Max(sample.Consonant, sourceStart), (source.LastVoicedFrame - 2) * Period));
+        }
+        var sourceFixed = Math.Clamp(Math.Max(sample.Consonant, sample.Preutterance) - sourceStart, 0, sourceEnd - sourceStart);
         var outputFixed = Math.Min(sourceFixed, segment.DurationMilliseconds * .45);
-        var offset = Math.Clamp(time - segment.StartMilliseconds, 0, segment.DurationMilliseconds);
-        var sourceTime = sourceStart + (offset < outputFixed ? offset * sourceFixed / outputFixed : sourceFixed +
-            (offset - outputFixed) * (sourceDuration - sourceStart - sourceFixed) / Math.Max(1, segment.DurationMilliseconds - outputFixed));
+        var offset = Math.Min(time - segment.StartMilliseconds, segment.DurationMilliseconds);
+        var sourceTime = segment.IsTransition ? sourceStart + offset * (sourceEnd - sourceStart) / segment.DurationMilliseconds
+            : offset < 0 ? sourceStart + offset
+            : sourceStart + (offset < outputFixed ? offset * sourceFixed / outputFixed : sourceFixed +
+                (offset - outputFixed) * (sourceEnd - sourceStart - sourceFixed) / Math.Max(1, segment.DurationMilliseconds - outputFixed));
         var position = Math.Clamp(sourceTime / Period, 0, source.F0.Length - 1);
         var left = (int)position; var right = Math.Min(left + 1, source.F0.Length - 1); var fraction = position - left;
         var midi = pitch?.Invoke(time) ?? segment.Midi;
@@ -267,6 +309,7 @@ public sealed class WorldRenderer : IDisposable {
             }
         }
         finally { Array.Clear(trimmed); }
+        result.LastVoicedFrame = Array.FindLastIndex(result.F0, value => value > 0);
         if (result.Bytes <= cacheBudget) {
             while (cacheBytes + result.Bytes > cacheBudget && recent.First != null) {
                 var victim = recent.First.Value; recent.RemoveFirst(); cacheBytes -= cache[victim].Bytes; cache.Remove(victim);

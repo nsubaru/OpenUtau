@@ -88,7 +88,44 @@ public class RenderingTests {
 
     private static PhonemeSegment[] Segments() => [new("a", 0, 300, 57), new("a", 300, 300, 57), new("a", 800, 200, 57)];
 
-    private static WorldRenderer Renderer(bool endingSource = false) {
+    [Fact]
+    public void LinkedVowelsDoNotRepeatTheUnvoicedAttackAfterAConsonantTransition() {
+        using var renderer = Renderer(endingSource: true);
+        var transition = new PhonemeSegment("a", 0, 100, 57) { IsTransition = true };
+        var vowel = new PhonemeSegment("a", 100, 300, 57);
+        var ordinary = renderer.RenderPages([transition, vowel], 450, new(), cancellation: TestContext.Current.CancellationToken).SelectMany(page => page).ToArray();
+        var linked = renderer.RenderPages([transition, vowel with { IsLinkedVowel = true }], 450, new(), cancellation: TestContext.Current.CancellationToken)
+            .SelectMany(page => page).ToArray();
+        Assert.True(Rms(linked, 110, 40) > 100);
+        Assert.True(Rms(linked, 110, 40) > Rms(ordinary, 110, 40) * 5, "The consonant transition already supplies the attack; the next vowel must remain voiced.");
+        Assert.True(Rms(linked, 425, 20) < 2, "Syllable blending must not fill the next rest.");
+    }
+
+    [Fact]
+    public void ShortTransitionsUseOnlyTheirConsonantCore() {
+        using var renderer = Renderer(consonantSource: true);
+        var pcm = renderer.RenderPages([new("a", 0, 100, 57) { IsTransition = true }], 150, new(), cancellation: TestContext.Current.CancellationToken)
+            .SelectMany(page => page).ToArray();
+        Assert.True(Rms(pcm, 60, 25) > 100, "A short transition must not stretch the unrelated source material after its consonant marker.");
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void InitialClusterTransitionsRetainTheConsonantsBeforePreutterance(bool prefixed) {
+        using var renderer = Renderer(initialCluster: true, prefixed: prefixed);
+        var pcm = renderer.RenderPages([new("- a", 0, 100, 57) { IsTransition = true }], 150, new(), cancellation: TestContext.Current.CancellationToken)
+            .SelectMany(page => page).ToArray();
+        Assert.True(Rms(pcm, 15, 35) > 100, "An initial cluster has no preceding recorded vowel to skip.");
+    }
+
+    private static double Rms(byte[] pcm, double start, double duration) {
+        var first = (int)Math.Round(start * 44.1);
+        var count = (int)Math.Round(duration * 44.1);
+        return Math.Sqrt(Enumerable.Range(first, count).Average(index => Math.Pow(BitConverter.ToInt16(pcm, index * 2), 2)));
+    }
+
+    private static WorldRenderer Renderer(bool endingSource = false, bool consonantSource = false, bool initialCluster = false, bool prefixed = false) {
         using var wave = new MemoryStream();
         using (var writer = new BinaryWriter(wave, Encoding.ASCII, true)) {
             const int count = 44100;
@@ -98,13 +135,17 @@ public class RenderingTests {
             writer.Write(0x61746164u); writer.Write(count * 2);
             for (var index = 0; index < count; index++) {
                 var time = index * 1000.0 / 44100;
-                var level = !endingSource ? 1 : time < 250 ? 0 : time < 500 ? 1 : Math.Clamp((750 - time) / 250, 0, 1);
+                var level = initialCluster ? time < 250 ? 1 : 0 : consonantSource ? time is >= 250 and < 350 ? 1 : 0
+                    : !endingSource ? 1 : time < 250 ? 0 : time < 500 ? 1 : Math.Clamp((750 - time) / 250, 0, 1);
                 writer.Write((short)(12000 * level * Math.Sin(index * 2 * Math.PI * 220 / 44100)));
             }
         }
         var bytes = wave.ToArray();
-        var oto = endingSource ? "a.wav=a,0,350,-750,250,10" : "a.wav=a,100,0,-800,0,10";
-        var resources = new StreamVoicebankResources(["oto.ini", "a.wav"], name => new MemoryStream(name == "oto.ini" ? Encoding.UTF8.GetBytes(oto) : bytes));
+        var oto = initialCluster ? "a.wav=- a,0,350,-750,250,10"
+            : endingSource || consonantSource ? "a.wav=a,0,350,-750,250,10" : "a.wav=a,100,0,-800,0,10";
+        if (prefixed) oto = oto.Replace("=", "=p_", StringComparison.Ordinal);
+        var resources = new StreamVoicebankResources(prefixed ? ["oto.ini", "a.wav", "prefix.map"] : ["oto.ini", "a.wav"], name =>
+            new MemoryStream(name == "prefix.map" ? "C4\tp_\t\n"u8.ToArray() : name == "oto.ini" ? Encoding.UTF8.GetBytes(oto) : bytes));
         return new WorldRenderer(new Voicebank(resources, Encoding.UTF8));
     }
 }

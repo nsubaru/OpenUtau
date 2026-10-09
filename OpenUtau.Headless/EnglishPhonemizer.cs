@@ -52,9 +52,14 @@ public sealed record PhonemeSegment(string Alias, double StartMilliseconds, doub
     public bool IsEnding { get; init; }
 
     /// <summary>
-    /// True for a short syllable transition beginning at the OTO preutterance anchor, excluding the preceding recorded vowel.
+    /// True for a short consonant transition; internal VC/CC aliases start at preutterance, while initial clusters retain their onset.
     /// </summary>
     public bool IsTransition { get; init; }
+
+    /// <summary>
+    /// True when the final consonant attack is already supplied, or a VV alias continues a preceding vowel; rendering begins at preutterance.
+    /// </summary>
+    public bool IsLinkedVowel { get; init; }
 }
 
 /// <summary>
@@ -105,12 +110,21 @@ public sealed class EnglishPhonemizer {
                 if (concrete.Length == 0) throw new InvalidDataException("Voicebank cannot realize this syllable.");
                 var duration = note.DurationMilliseconds * weights[v] / totalWeight;
                 var start = note.StartMilliseconds + elapsed;
-                var transition = concrete.Length > 1 ? Math.Min(50, duration * .4 / (concrete.Length - 1)) : 0;
+                var resolved = concrete.Select(alias => rules.ValidateAlias(alias, tone)).ToArray();
+                var samples = resolved.Select(alias => bank.Find(alias, tone) ?? throw new InvalidDataException($"Missing voicebank alias '{alias}'.")).ToArray();
+                var transitions = samples.Take(samples.Length - 1).Select((sample, index) => Math.Clamp(sample.Consonant -
+                    (resolved[index].StartsWith("- ", StringComparison.Ordinal) ? 0 : Math.Max(0, sample.Preutterance)), 20, 100)).ToArray();
+                var transitionScale = transitions.Length == 0 ? 1 : Math.Min(1, duration * .4 / transitions.Sum());
+                var lastConsonant = consonants.Length == 0 ? "" : rules.ValidateAlias(consonants[^1], tone);
+                var transitionTime = 0d;
                 for (var a = 0; a < concrete.Length; a++) {
-                    var alias = rules.ValidateAlias(concrete[a], tone);
-                    if (bank.Find(alias, tone) == null) throw new InvalidDataException($"Missing voicebank alias '{alias}'.");
-                    var length = a == concrete.Length - 1 ? duration - transition * a : transition;
-                    result.Add(new(alias, start + transition * a, length, note.Midi) { IsTransition = a < concrete.Length - 1 });
+                    var isTransition = a < concrete.Length - 1;
+                    var length = isTransition ? transitions[a] * transitionScale : duration - transitionTime;
+                    var attackCovered = a > 0 && lastConsonant.Length > 0 && resolved[a - 1].EndsWith(lastConsonant, StringComparison.Ordinal);
+                    var linkedVowel = !isTransition && (attackCovered || consonants.Length == 0 && previous.Length > 0);
+                    result.Add(new(resolved[a], start + transitionTime, length, note.Midi) {
+                        IsTransition = isTransition, IsLinkedVowel = linkedVowel });
+                    transitionTime += length;
                 }
                 previous = vowel.phone; pending = []; cursor = vowel.index + 1;
                 elapsed += duration;

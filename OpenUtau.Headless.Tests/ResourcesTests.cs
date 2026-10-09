@@ -81,9 +81,40 @@ public class ResourcesTests {
         Assert.Equal("i b", transition.Alias);
         Assert.False(transition.IsEnding);
         Assert.Equal(50, transition.DurationMilliseconds);
+        Assert.True(Assert.Single(segments, segment => segment.Alias == "bi").IsLinkedVowel);
+        Assert.False(segments[0].IsLinkedVowel);
         Assert.All(segments.Where(segment => !segment.IsTransition && !segment.IsEnding), segment => Assert.Contains(segment.Alias, new[] { "- i", "bi" }));
         Assert.Equal(700, segments[^1].StartMilliseconds + segments[^1].DurationMilliseconds);
         Assert.Equal(["oto.ini"], opened);
+    }
+
+    [Fact]
+    public void APartialClusterDoesNotSuppressTheRemainingCvConsonant() {
+        var resources = new StreamVoicebankResources(["oto.ini", "i.wav"], _ => new MemoryStream(Encoding.UTF8.GetBytes(
+            "i.wav=- i,0,50,-400,0,0\ni.wav=i,0,50,-400,0,0\ni.wav=i t,0,300,-400,250,20\ni.wav=t,0,65,-72,62,10\ni.wav=bi,0,50,-400,40,10\ni.wav=i -,0,300,-500,250,20")));
+        var segments = new EnglishPhonemizer(new Voicebank(resources, Encoding.UTF8)).Plan([
+            new() { Phonemes = ["IY1", "T", "B", "IY0"], DurationMilliseconds = 800, Midi = 60 }]);
+        Assert.Contains(segments, segment => segment.IsTransition);
+        var vowel = Assert.Single(segments, segment => segment.Alias == "bi");
+        Assert.False(vowel.IsLinkedVowel, "The preceding t alias does not supply the b attack.");
+        Assert.Equal(800, segments[^1].StartMilliseconds + segments[^1].DurationMilliseconds);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void InitialClustersReceiveTimeForTheirFullConsonantOnset(bool prefixed) {
+        var oto = "i.wav=- bi,0,50,-400,40,10\ni.wav=i,0,50,-400,0,0\ni.wav=- st,0,150,-200,120,0\ni.wav=ti,0,50,-400,40,10\ni.wav=i -,0,300,-500,250,20";
+        if (prefixed) oto = oto.Replace("=", "=p_", StringComparison.Ordinal);
+        var resources = new StreamVoicebankResources(prefixed ? ["oto.ini", "i.wav", "prefix.map"] : ["oto.ini", "i.wav"], name =>
+            new MemoryStream(Encoding.UTF8.GetBytes(name == "prefix.map" ? "C4\tp_\t\n" : oto)));
+        var segments = new EnglishPhonemizer(new Voicebank(resources, Encoding.UTF8)).Plan([
+            new() { Phonemes = ["S", "T", "IY1"], DurationMilliseconds = 500, Midi = 60 }]);
+        var onset = Assert.Single(segments, segment => segment.Alias == "- st");
+        Assert.True(onset.IsTransition);
+        Assert.Equal(100, onset.DurationMilliseconds);
+        Assert.True(Assert.Single(segments, segment => segment.Alias == "ti").IsLinkedVowel);
+        Assert.Equal(500, segments[^1].StartMilliseconds + segments[^1].DurationMilliseconds);
     }
 
     [Fact]
