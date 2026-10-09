@@ -12,6 +12,8 @@ Syllable allocation reserves time for consonant clusters, including the final co
 
 Build the managed library with `dotnet build OpenUtau.Headless/OpenUtau.Headless.csproj`. Build `openutau-worldcpu` with CMake using this directory as the source. WORLD and spline revisions and archive hashes match the existing native build; their existing patches are applied during dependency preparation. This target excludes desktop UI, neural renderers, ONNX, pyin, and debug NumPy output. Place the resulting native library beside the calling application.
 
+Output uses a bounded five-millisecond lookahead peak limiter with 50 ms gain recovery and 98% full-scale headroom. When no peak exceeds that threshold, output remains unchanged. Larger peaks are attenuated before PCM16 conversion rather than hard-clipped. Lookahead is consumed internally: sample counts, phrase timing, rests, and final releases remain unchanged, independently of PCM page sizes.
+
 Run metadata and pronunciation tests with `dotnet test --project OpenUtau.Headless.Tests/OpenUtau.Headless.Tests.csproj`. Filesystem support for the desktop applications is unchanged.
 
 Set `OPENUTAU_WORLD_LIBRARY` to the full path of the built CPU WORLD library to additionally run acoustic continuity, PCM page partitioning, window equivalence, rest, and cancellation checks. Those synthesis checks explicitly skip when the library path is absent.

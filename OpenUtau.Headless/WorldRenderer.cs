@@ -59,6 +59,33 @@ public sealed class WorldRenderer : IDisposable {
         public double MedianPitch { get; set; } = 220;
     }
 
+    private sealed class PeakLimiter {
+        private const int Lookahead = Rate / 200, Capacity = Lookahead + 1;
+        private static readonly double Release = Math.Exp(-1 / (Rate * .05));
+        private readonly double[] samples = new double[Capacity];
+        private readonly (long Index, double Level)[] peaks = new (long, double)[Capacity];
+        private long position, first, last;
+        private double gain = 1;
+
+        internal bool Process(double sample, out double output) {
+            var beginning = Math.Max(0, position - Lookahead);
+            while (first < last && peaks[first % Capacity].Index < beginning) first++;
+            var level = Math.Abs(sample);
+            while (last > first && peaks[(last - 1) % Capacity].Level <= level) last--;
+            peaks[last++ % Capacity] = (position, level);
+            samples[position % Capacity] = sample;
+            output = 0;
+            if (position++ < Lookahead) return false;
+            var maximum = peaks[first % Capacity].Level;
+            var target = maximum <= .98 ? 1 : .98 / maximum;
+            gain = target < gain ? target : target + (gain - target) * Release;
+            output = samples[beginning % Capacity] * gain;
+            return true;
+        }
+
+        internal void Clear() { Array.Clear(samples); Array.Clear(peaks); }
+    }
+
     /// <summary>
     /// Creates a renderer without loading audio or starting any inference runtime.
     /// </summary>
@@ -160,6 +187,7 @@ public sealed class WorldRenderer : IDisposable {
             var joiningSpectrum = new double[Width];
             var joiningAperiodicity = new double[Width];
             var block = new double[512];
+            var limiter = new PeakLimiter();
             var frame = 0;
             var emitted = 0;
             var segmentIndex = 0;
@@ -221,10 +249,12 @@ public sealed class WorldRenderer : IDisposable {
                         }
                         continue;
                     }
-                    for (var index = 0; index < count && emitted < samples; index++, emitted++) {
+                    for (var index = 0; index < count && emitted < samples; index++) {
+                        var input = double.IsFinite(block[index]) ? block[index] * gain : 0;
+                        if (!limiter.Process(input, out var limited)) continue;
                         // Taper only phrase edges; internal phoneme and PCM-page joins retain their energy and phase.
                         var taper = Math.Min(1, Math.Min(emitted, samples - 1 - emitted) / (Rate / 200.0));
-                        var value = double.IsFinite(block[index]) ? Math.Clamp(block[index] * gain * taper, -1, 1) : 0;
+                        var value = Math.Clamp(limited * taper, -1, 1);
                         BinaryPrimitives.WriteInt16LittleEndian(page!.AsSpan(filled, 2), (short)Math.Round(value * 32767));
                         filled += 2;
                         if (filled == page!.Length) {
@@ -233,6 +263,7 @@ public sealed class WorldRenderer : IDisposable {
                             filled = 0;
                             if (emitted + 1 < samples) page = new byte[Math.Min(samples - emitted - 1, (int)Math.Round(pageMilliseconds * Rate / 1000)) * 2];
                         }
+                        emitted++;
                     }
                 }
             } finally {
@@ -240,6 +271,7 @@ public sealed class WorldRenderer : IDisposable {
                 if (page != null) Array.Clear(page);
                 Array.Clear(block); Array.Clear(f0); Array.Clear(spectrum); Array.Clear(aperiodicity);
                 Array.Clear(joiningSpectrum); Array.Clear(joiningAperiodicity);
+                limiter.Clear();
             }
         }
     }

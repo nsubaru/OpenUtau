@@ -103,6 +103,31 @@ public class RenderingTests {
         return measurement.MeasurePitch("a");
     }
 
+    [Fact]
+    public void HighOutputLevelsAreLimitedWithoutClippingDroppingTailsOrChangingWithPageSize() {
+        using var renderer = Renderer();
+        var controls = new WorldControls { GainDecibels = 24 };
+        var large = renderer.RenderPages(Segments(), 1100, controls, cancellation: TestContext.Current.CancellationToken).SelectMany(page => page).ToArray();
+        var small = renderer.RenderPages(Segments(), 1100, controls, firstPageMilliseconds: 17, pageMilliseconds: 39,
+            cancellation: TestContext.Current.CancellationToken).SelectMany(page => page).ToArray();
+        Assert.Equal(1100 * 44100 / 1000 * 2, large.Length);
+        Assert.Equal(large, small);
+        var peak = Enumerable.Range(0, large.Length / 2).Max(index => Math.Abs((int)BitConverter.ToInt16(large, index * 2)));
+        Assert.InRange(peak, 30000, (int)Math.Ceiling(.98 * 32767));
+        Assert.True(Rms(large, 940, 40) > 1000, "Lookahead must retain the final voiced samples on their original timeline.");
+        Assert.True(Rms(large, 650, 80) < 2, "Limiter release must not fill explicit word pauses.");
+    }
+
+    [Fact]
+    public void OutputBelowTheLimiterThresholdRetainsLinearGain() {
+        using var renderer = Renderer();
+        var normal = renderer.RenderPages(Segments(), 1100, new(), cancellation: TestContext.Current.CancellationToken).SelectMany(page => page).ToArray();
+        var half = renderer.RenderPages(Segments(), 1100, new() { GainDecibels = 20 * Math.Log10(.5) },
+            cancellation: TestContext.Current.CancellationToken).SelectMany(page => page).ToArray();
+        for (var index = 0; index < normal.Length; index += 2)
+            Assert.InRange(Math.Abs(BitConverter.ToInt16(normal, index) - 2 * BitConverter.ToInt16(half, index)), 0, 1);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
