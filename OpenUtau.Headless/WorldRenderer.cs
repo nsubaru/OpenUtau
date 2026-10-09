@@ -230,7 +230,8 @@ public sealed class WorldRenderer : IDisposable {
         var sample = bank.Find(segment.Alias, (int)Math.Round(segment.Midi)) ?? throw new InvalidDataException($"Missing alias {segment.Alias}.");
         var source = Analyze(sample);
         var sourceDuration = (source.F0.Length - 1) * Period;
-        var sourceStart = segment.IsEnding ? Math.Clamp(sample.Preutterance, 0, sourceDuration) : 0;
+        // VC/CC transitions and releases begin at the OTO anchor. Their leading recorded vowel belongs to the previous segment.
+        var sourceStart = segment.IsEnding || segment.IsTransition ? Math.Clamp(sample.Preutterance, 0, sourceDuration) : 0;
         var sourceFixed = Math.Clamp(Math.Max(sample.Consonant, sample.Preutterance) - sourceStart, 0, sourceDuration - sourceStart);
         var outputFixed = Math.Min(sourceFixed, segment.DurationMilliseconds * .45);
         var offset = Math.Clamp(time - segment.StartMilliseconds, 0, segment.DurationMilliseconds);

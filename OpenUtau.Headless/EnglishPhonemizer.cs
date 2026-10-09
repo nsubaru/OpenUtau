@@ -47,9 +47,14 @@ public sealed record PhonemeNote {
 /// <param name="Midi">Nominal MIDI pitch for source selection and synthesis.</param>
 public sealed record PhonemeSegment(string Alias, double StartMilliseconds, double DurationMilliseconds, double Midi) {
     /// <summary>
-    /// True for an ending transition beginning at the OTO preutterance anchor; false preserves the ordinary source onset.
+    /// True for a final note release beginning at the OTO preutterance anchor.
     /// </summary>
     public bool IsEnding { get; init; }
+
+    /// <summary>
+    /// True for a short syllable transition beginning at the OTO preutterance anchor, excluding the preceding recorded vowel.
+    /// </summary>
+    public bool IsTransition { get; init; }
 }
 
 /// <summary>
@@ -105,7 +110,7 @@ public sealed class EnglishPhonemizer {
                     var alias = rules.ValidateAlias(concrete[a], tone);
                     if (bank.Find(alias, tone) == null) throw new InvalidDataException($"Missing voicebank alias '{alias}'.");
                     var length = a == concrete.Length - 1 ? duration - transition * a : transition;
-                    result.Add(new(alias, start + transition * a, length, note.Midi));
+                    result.Add(new(alias, start + transition * a, length, note.Midi) { IsTransition = a < concrete.Length - 1 });
                 }
                 previous = vowel.phone; pending = []; cursor = vowel.index + 1;
                 elapsed += duration;

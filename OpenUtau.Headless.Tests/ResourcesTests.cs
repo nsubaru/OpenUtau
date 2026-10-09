@@ -56,6 +56,37 @@ public class ResourcesTests {
     }
 
     [Fact]
+    public void UnstressedAhUsesSchwaWhileStressedAhKeepsTheStrongVowel() {
+        var resources = new StreamVoicebankResources(["oto.ini", "v.wav"], _ => new MemoryStream(Encoding.UTF8.GetBytes(
+            "v.wav=- @,0,50,-400,0,0\nv.wav=@,0,50,-400,0,0\nv.wav=@ -,0,300,-500,250,20\nv.wav=- V,0,50,-400,0,0\nv.wav=V,0,50,-400,0,0\nv.wav=V -,0,300,-500,250,20")));
+        var planner = new EnglishPhonemizer(new Voicebank(resources, Encoding.UTF8));
+        foreach (var (phone, alias) in new[] { ("AH0", "- @"), ("ah0", "- @"), ("AH1", "- V"), ("AH2", "- V") }) {
+            var segments = planner.Plan([new() { Phonemes = [phone], DurationMilliseconds = 400, Midi = 60 }]);
+            Assert.Equal(alias, segments[0].Alias);
+            Assert.Equal(400, segments[^1].StartMilliseconds + segments[^1].DurationMilliseconds);
+        }
+    }
+
+    [Fact]
+    public void SyllableTransitionsSkipTheRecordedPrecedingVowel() {
+        var opened = new List<string>();
+        var resources = new StreamVoicebankResources(["oto.ini", "i.wav"], name => {
+            opened.Add(name);
+            return new MemoryStream(Encoding.UTF8.GetBytes(
+                "i.wav=- i,0,50,-400,0,0\ni.wav=i,0,50,-400,0,0\ni.wav=i b,0,300,-400,250,20\ni.wav=bi,0,50,-400,40,10\ni.wav=i -,0,300,-500,250,20"));
+        });
+        var segments = new EnglishPhonemizer(new Voicebank(resources, Encoding.UTF8)).Plan([
+            new() { Phonemes = ["IY1", "B", "IY0"], DurationMilliseconds = 700, Midi = 60 }]);
+        var transition = Assert.Single(segments, segment => segment.IsTransition);
+        Assert.Equal("i b", transition.Alias);
+        Assert.False(transition.IsEnding);
+        Assert.Equal(50, transition.DurationMilliseconds);
+        Assert.All(segments.Where(segment => !segment.IsTransition && !segment.IsEnding), segment => Assert.Contains(segment.Alias, new[] { "- i", "bi" }));
+        Assert.Equal(700, segments[^1].StartMilliseconds + segments[^1].DurationMilliseconds);
+        Assert.Equal(["oto.ini"], opened);
+    }
+
+    [Fact]
     public void FinalConsonantsHaveTimeToSoundWithoutConsumingTheRest() {
         var opened = new List<string>();
         var resources = new StreamVoicebankResources(["oto.ini", "i.wav"], name => {

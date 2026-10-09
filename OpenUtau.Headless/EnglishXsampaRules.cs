@@ -290,7 +290,9 @@ internal sealed class EnglishXsampaRules {
                 {"3", "r"}
             };
         public string[] Prepare(string[] input, int tone) {
-            string[] original = input.Select(p => Regex.Replace(p.ToLowerInvariant(), "[012]$", "")).ToArray();
+            // CMU's unstressed AH0 is schwa; retain that distinction before dropping stress suffixes.
+            string[] original = input.Select(p => p.Equals("AH0", StringComparison.OrdinalIgnoreCase)
+                ? "ax" : Regex.Replace(p.ToLowerInvariant(), "[012]$", "")).ToArray();
             if (original == null) {
                 return [];
             }

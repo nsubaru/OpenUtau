@@ -65,20 +65,25 @@ public class RenderingTests {
         Assert.Throws<ArgumentException>(() => renderer.RenderPages([new("a", 0, 500, double.NaN)], 1100, new()).ToArray());
     }
 
-    [Fact]
-    public void EndingSourcesSkipTheirLeadingVowelAndFinishBeforeTheRest() {
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void TransitionAndEndingSourcesSkipTheirLeadingVowelAndFinishBeforeTheRest(bool ending) {
         using var renderer = Renderer(endingSource: true);
-        var segment = new PhonemeSegment("a", 0, 200, 57);
-        var ordinary = renderer.RenderPages([segment], 250, new()).SelectMany(page => page).ToArray();
-        var ending = renderer.RenderPages([segment with { IsEnding = true }], 250, new()).SelectMany(page => page).ToArray();
+        var duration = ending ? 200 : 50;
+        var segment = new PhonemeSegment("a", 0, duration, 57);
+        var ordinary = renderer.RenderPages([segment], 250, new(), cancellation: TestContext.Current.CancellationToken).SelectMany(page => page).ToArray();
+        var anchored = renderer.RenderPages([segment with { IsEnding = ending, IsTransition = !ending }], 250, new(), cancellation: TestContext.Current.CancellationToken)
+            .SelectMany(page => page).ToArray();
         static double Rms(byte[] pcm, double start, double duration) {
             var first = (int)Math.Round(start * 44.1);
             var count = (int)Math.Round(duration * 44.1);
             return Math.Sqrt(Enumerable.Range(first, count).Average(index => Math.Pow(BitConverter.ToInt16(pcm, index * 2), 2)));
         }
-        Assert.True(Rms(ending, 20, 40) > 100, "Ending content must begin at its OTO anchor.");
-        Assert.True(Rms(ordinary, 20, 40) < Rms(ending, 20, 40) * .1, "The leading source region is intentionally silent in this fixture.");
-        Assert.True(Rms(ending, 225, 20) < 2, "The ending must not consume the following rest.");
+        Assert.True(Rms(anchored, duration * .1, duration * .2) > 100, "Transition content must begin at its OTO anchor.");
+        Assert.True(Rms(ordinary, duration * .1, duration * .2) < Rms(anchored, duration * .1, duration * .2) * .1,
+            "The leading source region is intentionally silent in this fixture.");
+        Assert.True(Rms(anchored, duration + 25, 20) < 2, "The transition must not consume the following rest.");
     }
 
     private static PhonemeSegment[] Segments() => [new("a", 0, 300, 57), new("a", 300, 300, 57), new("a", 800, 200, 57)];
