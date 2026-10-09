@@ -230,11 +230,12 @@ public sealed class WorldRenderer : IDisposable {
         var sample = bank.Find(segment.Alias, (int)Math.Round(segment.Midi)) ?? throw new InvalidDataException($"Missing alias {segment.Alias}.");
         var source = Analyze(sample);
         var sourceDuration = (source.F0.Length - 1) * Period;
-        var sourceFixed = Math.Clamp(Math.Max(sample.Consonant, sample.Preutterance), 0, sourceDuration);
+        var sourceStart = segment.IsEnding ? Math.Clamp(sample.Preutterance, 0, sourceDuration) : 0;
+        var sourceFixed = Math.Clamp(Math.Max(sample.Consonant, sample.Preutterance) - sourceStart, 0, sourceDuration - sourceStart);
         var outputFixed = Math.Min(sourceFixed, segment.DurationMilliseconds * .45);
         var offset = Math.Clamp(time - segment.StartMilliseconds, 0, segment.DurationMilliseconds);
-        var sourceTime = offset < outputFixed ? offset * sourceFixed / outputFixed : sourceFixed +
-            (offset - outputFixed) * (sourceDuration - sourceFixed) / Math.Max(1, segment.DurationMilliseconds - outputFixed);
+        var sourceTime = sourceStart + (offset < outputFixed ? offset * sourceFixed / outputFixed : sourceFixed +
+            (offset - outputFixed) * (sourceDuration - sourceStart - sourceFixed) / Math.Max(1, segment.DurationMilliseconds - outputFixed));
         var position = Math.Clamp(sourceTime / Period, 0, source.F0.Length - 1);
         var left = (int)position; var right = Math.Min(left + 1, source.F0.Length - 1); var fraction = position - left;
         var midi = pitch?.Invoke(time) ?? segment.Midi;

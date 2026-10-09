@@ -56,6 +56,48 @@ public class ResourcesTests {
     }
 
     [Fact]
+    public void FinalConsonantsHaveTimeToSoundWithoutConsumingTheRest() {
+        var opened = new List<string>();
+        var resources = new StreamVoicebankResources(["oto.ini", "i.wav"], name => {
+            opened.Add(name);
+            return new MemoryStream(Encoding.UTF8.GetBytes("i.wav=- bi,0,50,-400,40,10\ni.wav=i,0,50,-400,0,0\ni.wav=i -,0,300,-500,250,20\ni.wav=i d-,0,300,-500,250,20"));
+        });
+        var planner = new EnglishPhonemizer(new Voicebank(resources, Encoding.UTF8));
+        var segments = planner.Plan([
+            new() { Phonemes = ["B", "IY1", "D"], DurationMilliseconds = 500, Midi = 60 },
+            new() { Phonemes = ["B", "IY1"], StartMilliseconds = 580, DurationMilliseconds = 500, Midi = 60 }]);
+        var ending = Assert.Single(segments.Where(segment => segment.Alias == "i d-"));
+        Assert.True(ending.IsEnding);
+        Assert.True(ending.DurationMilliseconds >= 100);
+        Assert.Equal(500, ending.StartMilliseconds + ending.DurationMilliseconds);
+        Assert.Equal(580, segments.First(segment => segment.StartMilliseconds >= 500).StartMilliseconds);
+        Assert.Equal(["oto.ini"], opened);
+    }
+
+    [Fact]
+    public void FinalClustersKeepTheirTransitionsWithinTheSuppliedNote() {
+        var resources = new StreamVoicebankResources(["oto.ini", "i.wav"], _ => new MemoryStream(Encoding.UTF8.GetBytes(
+            "i.wav=- bi,0,50,-400,40,10\ni.wav=i,0,50,-400,0,0\ni.wav=i s,0,300,-400,250,20\ni.wav=s t-,0,300,-500,150,20")));
+        var segments = new EnglishPhonemizer(new Voicebank(resources, Encoding.UTF8)).Plan([
+            new() { Phonemes = ["B", "IY1", "S", "T"], DurationMilliseconds = 600, Midi = 60 }]);
+        var endings = segments.Where(segment => segment.IsEnding).ToArray();
+        Assert.Equal(["i s", "s t-"], endings.Select(segment => segment.Alias));
+        Assert.All(endings, segment => Assert.True(segment.DurationMilliseconds >= 90));
+        Assert.Equal(600, segments[^1].StartMilliseconds + segments[^1].DurationMilliseconds);
+    }
+
+    [Fact]
+    public void EndingAliasesUseTheSameBankFallbackAsOnsets() {
+        var resources = new StreamVoicebankResources(["oto.ini", "v.wav"], _ => new MemoryStream(Encoding.UTF8.GetBytes(
+            "v.wav=- V,0,50,-400,0,0\nv.wav=V,0,50,-400,0,0\nv.wav=@ t-,0,300,-500,250,20")));
+        var segments = new EnglishPhonemizer(new Voicebank(resources, Encoding.UTF8)).Plan([
+            new() { Phonemes = ["AH1", "T"], DurationMilliseconds = 400, Midi = 60 }]);
+        var ending = Assert.Single(segments.Where(segment => segment.IsEnding));
+        Assert.Equal("@ t-", ending.Alias);
+        Assert.Equal(400, ending.StartMilliseconds + ending.DurationMilliseconds);
+    }
+
+    [Fact]
     public void SourceDurationIsBoundedBeforeWorldAnalysis() {
         var pcm = new byte[44100 * 2];
         using var wave = new MemoryStream();
