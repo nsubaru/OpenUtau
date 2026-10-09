@@ -63,6 +63,44 @@ public class RenderingTests {
         Assert.Throws<ArgumentOutOfRangeException>(() => renderer.RenderPages(Segments(), 1100, new() { Timbre = double.NaN }).ToArray());
         Assert.Throws<ArgumentException>(() => renderer.RenderPages([new("a", 0, 500, 57), new("a", 400, 100, 57)], 1100, new()).ToArray());
         Assert.Throws<ArgumentException>(() => renderer.RenderPages([new("a", 0, 500, double.NaN)], 1100, new()).ToArray());
+        foreach (var variation in new[] { double.NaN, -.1, 2.1 })
+            Assert.Throws<ArgumentOutOfRangeException>(() => renderer.RenderPages(Segments(), 1100, new() { SourcePitchVariationSemitones = variation }).ToArray());
+    }
+
+    [Fact]
+    public void SourcePitchMovementIsBoundedAndOptInWhilePagesStayEquivalent() {
+        using var renderer = Renderer(varyingPitch: true);
+        var segments = new[] { new PhonemeSegment("a", 0, 800, 57) };
+        var fixedPitch = renderer.RenderPages(segments, 850, new(), cancellation: TestContext.Current.CancellationToken).SelectMany(page => page).ToArray();
+        var controls = new WorldControls { SourcePitchVariationSemitones = .75 };
+        var naturalPitch = renderer.RenderPages(segments, 850, controls, cancellation: TestContext.Current.CancellationToken).SelectMany(page => page).ToArray();
+        var smallPages = renderer.RenderPages(segments, 850, controls, firstPageMilliseconds: 17, pageMilliseconds: 39,
+            cancellation: TestContext.Current.CancellationToken).SelectMany(page => page).ToArray();
+        Assert.Equal(naturalPitch, smallPages);
+        Assert.InRange(MeasureOutputPitch(fixedPitch, 100, 150), 216, 224);
+        Assert.InRange(MeasureOutputPitch(fixedPitch, 550, 150), 216, 224);
+        var early = MeasureOutputPitch(naturalPitch, 100, 150);
+        var late = MeasureOutputPitch(naturalPitch, 550, 150);
+        Assert.True(late > early + 10, "Retained source movement must survive synthesis instead of becoming another fixed note.");
+        Assert.InRange(early, 220 * Math.Pow(2, -.75 / 12) - 4, 224);
+        Assert.InRange(late, 216, 220 * Math.Pow(2, .75 / 12) + 4);
+    }
+
+    private static double MeasureOutputPitch(byte[] pcm, double start, double duration) {
+        var first = (int)Math.Round(start * 44.1) * 2;
+        var count = (int)Math.Round(duration * 44.1) * 2;
+        using var wave = new MemoryStream();
+        using (var writer = new BinaryWriter(wave, Encoding.ASCII, true)) {
+            writer.Write(0x46464952u); writer.Write(36 + count); writer.Write(0x45564157u);
+            writer.Write(0x20746d66u); writer.Write(16u); writer.Write((ushort)1); writer.Write((ushort)1);
+            writer.Write(44100u); writer.Write(88200u); writer.Write((ushort)2); writer.Write((ushort)16);
+            writer.Write(0x61746164u); writer.Write(count); writer.Write(pcm, first, count);
+        }
+        var bytes = wave.ToArray();
+        var resources = new StreamVoicebankResources(["oto.ini", "output.wav"], name =>
+            new MemoryStream(name == "oto.ini" ? "output.wav=a,0,0,0,0,0"u8.ToArray() : bytes));
+        using var measurement = new WorldRenderer(new Voicebank(resources, Encoding.UTF8));
+        return measurement.MeasurePitch("a");
     }
 
     [Theory]
@@ -125,7 +163,7 @@ public class RenderingTests {
         return Math.Sqrt(Enumerable.Range(first, count).Average(index => Math.Pow(BitConverter.ToInt16(pcm, index * 2), 2)));
     }
 
-    private static WorldRenderer Renderer(bool endingSource = false, bool consonantSource = false, bool initialCluster = false, bool prefixed = false) {
+    private static WorldRenderer Renderer(bool endingSource = false, bool consonantSource = false, bool initialCluster = false, bool prefixed = false, bool varyingPitch = false) {
         using var wave = new MemoryStream();
         using (var writer = new BinaryWriter(wave, Encoding.ASCII, true)) {
             const int count = 44100;
@@ -137,7 +175,9 @@ public class RenderingTests {
                 var time = index * 1000.0 / 44100;
                 var level = initialCluster ? time < 250 ? 1 : 0 : consonantSource ? time is >= 250 and < 350 ? 1 : 0
                     : !endingSource ? 1 : time < 250 ? 0 : time < 500 ? 1 : Math.Clamp((750 - time) / 250, 0, 1);
-                writer.Write((short)(12000 * level * Math.Sin(index * 2 * Math.PI * 220 / 44100)));
+                var seconds = index / 44100.0;
+                var cycles = varyingPitch ? 160 * seconds + 60 * seconds * seconds : 220 * seconds;
+                writer.Write((short)(12000 * level * Math.Sin(2 * Math.PI * cycles)));
             }
         }
         var bytes = wave.ToArray();
