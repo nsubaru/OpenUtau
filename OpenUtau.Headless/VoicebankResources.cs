@@ -148,6 +148,8 @@ public sealed class Voicebank {
                 if (!resources.Names.Contains(resource)) throw new InvalidDataException($"Missing oto sample {resource}.");
                 var alias = fields[0].Length == 0 ? Path.GetFileNameWithoutExtension(file) : fields[0];
                 double Number(int index) {
+                    // UTAU treats an omitted numeric value as zero, including leading offsets.
+                    if (fields[index].Length == 0) return 0;
                     if (!double.TryParse(fields[index], NumberStyles.Float, CultureInfo.InvariantCulture, out var value) || !double.IsFinite(value))
                         throw new InvalidDataException($"Invalid oto timing in {name}.");
                     return value;

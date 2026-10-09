@@ -31,6 +31,35 @@ public class ResourcesTests {
     }
 
     [Fact]
+    public void EmptyOtoTimingFieldsUseDesktopZeroDefaults() {
+        var resources = new StreamVoicebankResources(["oto.ini", "v.wav"], _ => new MemoryStream(
+            "v.wav=empty,,,,,\nv.wav=onset,,57.14,-91.16,44.1,22.05"u8.ToArray()));
+        var bank = new Voicebank(resources, Encoding.UTF8);
+        var empty = bank.Find("empty", 60)!;
+        Assert.Equal(0, empty.Offset);
+        Assert.Equal(0, empty.Consonant);
+        Assert.Equal(0, empty.Cutoff);
+        Assert.Equal(0, empty.Preutterance);
+        Assert.Equal(0, empty.Overlap);
+        var onset = bank.Find("onset", 60)!;
+        Assert.Equal(0, onset.Offset);
+        Assert.Equal(57.14, onset.Consonant);
+        Assert.Equal(-91.16, onset.Cutoff);
+        Assert.Equal(44.1, onset.Preutterance);
+        Assert.Equal(22.05, onset.Overlap);
+    }
+
+    [Theory]
+    [InlineData("not-a-number")]
+    [InlineData("NaN")]
+    [InlineData("Infinity")]
+    public void InvalidOtoTimingRemainsRejected(string value) {
+        var resources = new StreamVoicebankResources(["oto.ini", "v.wav"], _ => new MemoryStream(
+            Encoding.UTF8.GetBytes($"v.wav=invalid,{value},0,0,0,0")));
+        Assert.Throws<InvalidDataException>(() => new Voicebank(resources, Encoding.UTF8));
+    }
+
+    [Fact]
     public void SuppliedPronunciationPlansOnlyAvailableAliases() {
         var bank = new Voicebank(BankResources([]), Encoding.UTF8);
         var segments = new EnglishPhonemizer(bank).Plan([new() { Phonemes = ["B", "IY1"], DurationMilliseconds = 500, Midi = 60 }]);
